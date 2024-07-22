@@ -16,6 +16,6 @@
   specific language governing permissions and limitations
   under the License.
 -->
-# Environments CI scripts
+# JIT Executor :: Native
 
-This folder contains update scripts which would be called for a specific environments.
+Native distributions of the JIT Executor for Windows, macOS and Linux.

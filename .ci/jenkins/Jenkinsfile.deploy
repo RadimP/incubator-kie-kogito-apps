@@ -2,18 +2,16 @@ import org.jenkinsci.plugins.workflow.libs.Library
 @Library('jenkins-pipeline-shared-libraries')_
 
 import org.kie.jenkins.MavenCommand
-import org.kie.jenkins.MavenStagingHelper
 
 deployProperties = [:]
 
 pipeline {
     agent {
-        label 'kie-rhel8 && docker && kie-mem16g && !built-in'
-    }
-
-    tools {
-        maven env.BUILD_MAVEN_TOOL
-        jdk env.BUILD_JDK_TOOL
+        docker { 
+            image env.AGENT_DOCKER_BUILDER_IMAGE
+            args env.AGENT_DOCKER_BUILDER_ARGS
+            label util.avoidFaultyNodes()
+        }
     }
 
     options {
@@ -30,19 +28,14 @@ pipeline {
 
         KOGITO_CI_EMAIL_TO = credentials("${JENKINS_EMAIL_CREDS_ID}")
 
-        // Keep here for visitibility
-        MAVEN_OPTS = '-Xms1024m -Xmx4g'
-        NODE_OPTIONS = '--max_old_space_size=4096'
-
         PR_BRANCH_HASH = "${util.generateHash(10)}"
-        MAVEN_DEPLOY_LOCAL_DIR = "${WORKSPACE}/maven_deploy_dir"
     }
 
     stages {
         stage('Initialize') {
             steps {
                 script {
-                    cleanWs()
+                    cleanWs(disableDeferredWipeout: true)
 
                     if (params.DISPLAY_NAME) {
                         currentBuild.displayName = params.DISPLAY_NAME
@@ -61,8 +54,6 @@ pipeline {
                     dir(getRepoName()) {
                         checkoutRepo()
                     }
-
-                    setupCypressEnv('12.17.0')
                 }
             }
             post {
@@ -84,7 +75,7 @@ pipeline {
                 script {
                     dir(getRepoName()) {
                         if (githubscm.isBranchExist('origin',getPRBranch())) {
-                            githubscm.removeRemoteBranch('origin', getPRBranch())
+                            githubscm.removeRemoteBranch('origin', getPRBranch(), getGitAuthorPushCredsId())
                         }
                         githubscm.createBranch(getPRBranch())
                     }
@@ -98,16 +89,46 @@ pipeline {
             steps {
                 script {
                     dir(getRepoName()) {
-                        maven.mvnVersionsUpdateParentAndChildModules(getMavenCommand(), getProjectVersion(), !isRelease())
+                        configFileProvider([configFile(fileId: env.MAVEN_SETTINGS_CONFIG_FILE_ID, variable: 'MAVEN_SETTINGS_FILE')]){
+                            maven.mvnVersionsUpdateParentAndChildModules(
+                                getMavenCommand().withSettingsXmlFile(MAVEN_SETTINGS_FILE),
+                                getProjectVersion(),
+                                !isRelease()
+                            )
+                        }
                     }
                 }
             }
         }
-        stage('Deploy kogito-apps locally') {
+        stage('Deploy kogito-apps') {
             steps {
                 script {
-                    dir(getRepoName()){
-                        runMavenDeploy(params.SKIP_TESTS, true)
+                    withCredentials([usernamePassword(credentialsId: env.MAVEN_REPO_CREDS_ID, usernameVariable: 'REPOSITORY_USER', passwordVariable: 'REPOSITORY_TOKEN')]) {
+                        def installOrDeploy
+                        if (shouldDeployToRepository()) {
+                            installOrDeploy = "deploy -DdeployAtEnd -Dapache.repository.username=${REPOSITORY_USER} -Dapache.repository.password=${REPOSITORY_TOKEN} -DretryFailedDeploymentCount=5"
+                        } else {
+                            installOrDeploy = 'install'
+                        }
+
+                        def mavenCommand = getMavenCommand().withProperty('maven.test.failure.ignore', true)
+                           .withOptions(env.BUILD_MVN_OPTS_CURRENT ? [ env.BUILD_MVN_OPTS_CURRENT ] : [])
+                           .withOptions(env.KOGITO_APPS_BUILD_MVN_OPTS ? [ env.KOGITO_APPS_BUILD_MVN_OPTS ] : [])
+                           .skipTests(skipTests)
+
+                        def Closure mavenRunClosure = {
+                            configFileProvider([configFile(fileId: env.MAVEN_SETTINGS_CONFIG_FILE_ID, variable: 'MAVEN_SETTINGS_FILE')]) {
+                                mavenCommand.withSettingsXmlFile(MAVEN_SETTINGS_FILE)
+                                    .run("clean $installOrDeploy")
+                            }
+                        }
+                        if (isRelease()) {
+                            release.gpgImportKeyFromStringWithoutPassword(getReleaseGpgSignKeyCredsId())
+                            mavenCommand.withProfiles(['apache-release'])
+                            mavenRunClosure()
+                        } else {
+                            mavenRunClosure()
+                        }
                     }
                 }
             }
@@ -116,30 +137,6 @@ pipeline {
                     script {
                         saveReports()
                         util.archiveConsoleLog()
-                    }
-                }
-            }
-        }
-        stage('Upload artifacts to given repository') {
-            when {
-                expression { return !isRelease() && shouldDeployToRepository() }
-            }
-            steps {
-                script {
-                    // Deploy to specific repository with credentials
-                    maven.uploadLocalArtifacts(env.MAVEN_REPO_CREDS_ID, getLocalDeploymentFolder(), getMavenRepoZipUrl())
-                }
-            }
-        }
-        stage('Stage artifacts') {
-            when {
-                expression { return shouldStageArtifacts() }
-            }
-            steps {
-                script {
-                    dir(getRepoName()){
-                        // Stage release artifacts
-                        runMavenStage()
                     }
                 }
             }
@@ -184,15 +181,9 @@ pipeline {
         }
         cleanup {
             script {
-                util.cleanNode('docker')
+                util.cleanNode()
             }
         }
-    }
-}
-
-void setupCypressEnv(String cypressVersion) {
-    if (env.CYPRESS_BINARY_URL) {
-        env.CYPRESS_INSTALL_BINARY = "${CYPRESS_BINARY_URL}/cypress-${cypressVersion}.zip"
     }
 }
 
@@ -214,7 +205,7 @@ void saveReports() {
 
 void checkoutRepo() {
     deleteDir()
-    checkout(githubscm.resolveRepository(getRepoName(), getGitAuthor(), getBuildBranch(), false))
+    checkout(githubscm.resolveRepository(getRepoName(), getGitAuthor(), getBuildBranch(), false, getGitAuthorCredsId()))
 }
 
 void commitAndCreatePR() {
@@ -225,21 +216,14 @@ void commitAndCreatePR() {
     } else {
         prBody += '\nPlease review and merge.'
     }
+    githubscm.setUserConfigFromCreds(getGitAuthorPushCredsId())
     githubscm.commitChanges(commitMsg, { githubscm.findAndStageNotIgnoredFiles('pom.xml') })
-    githubscm.pushObject('origin', getPRBranch(), getGitAuthorCredsID())
-    deployProperties["${getRepoName()}.pr.link"] = githubscm.createPRWithLabels(commitMsg, prBody, getBuildBranch(), ['skip-ci'] as String[], getGitAuthorCredsID()) 
-}
-
-boolean isSpecificArtifactsUpload() {
-    return env.MAVEN_DEPLOY_REPOSITORY && env.MAVEN_REPO_CREDS_ID
-}
-
-boolean shouldStageArtifacts() {
-    return isRelease()
+    githubscm.pushObject('origin', getPRBranch(), getGitAuthorPushCredsId())
+    deployProperties["${getRepoName()}.pr.link"] = githubscm.createPRWithLabels(commitMsg, prBody, getBuildBranch(), ['skip-ci'] as String[], getGitAuthorCredsId()) 
 }
 
 boolean shouldDeployToRepository() {
-    return env.MAVEN_DEPLOY_REPOSITORY && env.MAVEN_REPO_CREDS_ID && getGitAuthor() == 'kiegroup'
+    return env.MAVEN_DEPLOY_REPOSITORY && env.MAVEN_REPO_CREDS_ID && getGitAuthor() == 'apache'
 }
 
 boolean isRelease() {
@@ -259,8 +243,8 @@ String getGitAuthor() {
     return "${GIT_AUTHOR}"
 }
 
-String getGitAuthorCredsID() {
-    return env.AUTHOR_CREDS_ID
+String getGitAuthorCredsId() {
+    return env.GIT_AUTHOR_CREDS_ID
 }
 
 String getBuildBranch() {
@@ -281,45 +265,18 @@ void setDeployPropertyIfNeeded(String key, def value) {
     }
 }
 
-MavenCommand getMavenCommand() {
+MavenCommand getMavenCommand(String directory = '') {
+    directory = directory ?: getRepoName()
     return new MavenCommand(this, ['-fae', '-ntp'])
-            .withSettingsXmlId(env.MAVEN_SETTINGS_CONFIG_FILE_ID)
-            .withOptions(env.BUILD_MVN_OPTS ? [ env.BUILD_MVN_OPTS ] : [])
-            .withProperty('full')
+                .withOptions(env.BUILD_MVN_OPTS ? [ env.BUILD_MVN_OPTS ] : [])
+                .inDirectory(directory)
+                .withProperty('full')
 }
 
-void runMavenDeploy(boolean skipTests = true, boolean localDeployment = false) {
-    mvnCmd = getMavenCommand()
-
-    if (localDeployment) {
-        mvnCmd.withLocalDeployFolder(getLocalDeploymentFolder())
-    } else if (env.MAVEN_DEPLOY_REPOSITORY) {
-        mvnCmd.withDeployRepository(env.MAVEN_DEPLOY_REPOSITORY)
-    }
-
-    mvnCmd.withProperty('maven.test.failure.ignore', true)
-        .withOptions(env.BUILD_MVN_OPTS_CURRENT ? [ env.BUILD_MVN_OPTS_CURRENT ] : [])
-        .withOptions(env.KOGITO_APPS_BUILD_MVN_OPTS ? [ env.KOGITO_APPS_BUILD_MVN_OPTS ] : [])
-        .skipTests(skipTests)
-        .run('clean deploy')
+String getReleaseGpgSignKeyCredsId() {
+    return env.RELEASE_GPG_SIGN_KEY_CREDS_ID
 }
 
-void runMavenStage() {
-    MavenStagingHelper stagingHelper = getStagingHelper()
-    deployProperties.putAll(stagingHelper.stageLocalArtifacts(env.NEXUS_STAGING_PROFILE_ID, getLocalDeploymentFolder()))
-    stagingHelper.promoteStagingRepository(env.NEXUS_BUILD_PROMOTION_PROFILE_ID)
-}
-
-MavenStagingHelper getStagingHelper() {
-    return new MavenStagingHelper(this, getMavenCommand())
-            .withNexusReleaseUrl(env.NEXUS_RELEASE_URL)
-            .withNexusReleaseRepositoryId(env.NEXUS_RELEASE_REPOSITORY_ID)
-}
-
-String getLocalDeploymentFolder() {
-    return "${env.MAVEN_DEPLOY_LOCAL_DIR}/${getRepoName()}"
-}
-
-String getMavenRepoZipUrl() {
-    return "${env.MAVEN_DEPLOY_REPOSITORY.replaceAll('/content/', '/service/local/').replaceFirst('/*$', '')}/content-compressed"
+String getReleaseGpgSignPassphraseCredsId() {
+    return env.RELEASE_GPG_SIGN_PASSPHRASE_CREDS_ID
 }
